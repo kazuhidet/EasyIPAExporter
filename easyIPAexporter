@@ -1,0 +1,166 @@
+#!/bin/bash
+
+on_exit () {
+  exit_code=$?
+  exit $exit_code
+}
+
+trap on_exit EXIT
+
+USER_NAME=`whoami`
+ARCHIVE_PATH=$1
+EXPORT_PATH=$2
+EXPORT_METOHD=$3
+
+function parse_info_plist {
+  info_plist_file=$1
+  
+  app_properties=`/usr/libexec/PlistBuddy -c "Print ApplicationProperties" "${info_plist_file}" 2>/dev/null || true`
+  if [ ! -z "$app_properties" ]; then
+    APP_ID=`/usr/libexec/PlistBuddy -c "Print ApplicationProperties:CFBundleIdentifier" "${info_plist_file}" 2>/dev/null || true`
+  else
+    # Maybe extension or whats ???
+    APP_ID=`/usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" "${info_plist_file}" 2>/dev/null || true`
+  fi
+  if [ ! -z "#{APP_ID}" ]; then
+    # Remove old mobileprovision
+    tatget_mobileprovision_files=`(cd "/Users/${USER_NAME}/Library/MobileDevice/Provisioning Profiles/" ;ls *.mobileprovision)`
+    for tatget_mobileprovision_file in ${tatget_mobileprovision_files}; do
+      plain_text=`security cms -D -i "/Users/${USER_NAME}/Library/MobileDevice/Provisioning Profiles/${tatget_mobileprovision_file}"`
+
+      name=`/usr/libexec/PlistBuddy -c "Print name" /dev/stdin <<< $(echo "$plain_text") 2>/dev/null || true`
+      if [ $(echo name | grep -e "^iOS Team") ]; then
+        # for automatic signing
+        continue
+      fi
+
+      expiration_date=`/usr/libexec/PlistBuddy -c "Print ExpirationDate" /dev/stdin <<< $(echo "$plain_text") 2>/dev/null || true`
+      expire=`LC_ALL=C date -j -f "%A %b %d %H:%M:%S %Z %Y" "$expiration_date" '+%s'`
+      today=`date '+%s'`
+      leftdays=$((($expire-$today)/86400))
+      if [ $today -gt $expire ]; then
+        # Useful for Clean up expired prefiles.
+        #rm -f "/Users/${USER_NAME}/Library/MobileDevice/Provisioning Profiles/${tatget_mobileprovision_file}"
+        continue
+      fi
+
+      beta_active=`/usr/libexec/PlistBuddy -c "Print Entitlements:beta-reports-active" /dev/stdin <<< $(echo "${plain_text}") 2>/dev/null || true`
+      app_identifier=`/usr/libexec/PlistBuddy -c "Print Entitlements:application-identifier" /dev/stdin <<< $(echo "${plain_text}") 2>/dev/null || true`
+      if [ "${beta_active}" = "true" ]; then
+        # Maybe Production
+        target_env='app-store'
+      else
+        task_allow=`/usr/libexec/PlistBuddy -c "Print Entitlements:get-task-allow" /dev/stdin <<< $(echo "${plain_text}") 2>/dev/null || true`
+        if [ "${task_allow}" = "true" ]; then
+          # Maybe Development
+          target_env='development'
+        else
+          # Maybe AdHoc
+          target_env='ad-hoc'
+        fi
+      fi
+      dev_team_id=`/usr/libexec/PlistBuddy -c "Print Entitlements:com.apple.developer.team-identifier" /dev/stdin <<< $(echo "${plain_text}") 2>/dev/null || true`
+      app_bundle_id=`echo ${app_identifier} | sed -e "s/^${dev_team_id}\.//g"`
+      provisioning_uuid=`/usr/libexec/PlistBuddy -c "Print UUID" /dev/stdin <<< $(echo "${plain_text}") 2>/dev/null || true`
+
+      if [ "${app_bundle_id}" = "${APP_ID}" ] && [ "${target_env}" = "${EXPORT_METOHD}" ]; then
+        echo "$app_bundle_id $dev_team_id $provisioning_uuid"
+        exit
+      fi
+    done
+  fi
+}
+
+if [ -d "$ARCHIVE_PATH" ]; then
+  abs_archive_path=$(cd "$ARCHIVE_PATH" && pwd)
+fi
+if [ ! -d "$EXPORT_PATH" ]; then
+  mkdir -p "$EXPORT_PATH"
+fi
+abs_export_path=$(cd "$EXPORT_PATH" && pwd)
+
+app_directories=`find "${ARCHIVE_PATH}/Products/Applications" -name *.app -o -name *.appex`
+
+provisioning_profile_list=""
+for app_dir in $app_directories; do
+  echo app_dir: \"${app_dir}\"
+  if [ -f "${app_dir}/Info.plist" ]; then
+    mobileprovision=$(parse_info_plist "${app_dir}/Info.plist")
+    if [ -z "${mobileprovision}" ]; then
+      continue
+    fi
+    set ${mobileprovision}
+    buidle_id=${1}
+    apple_dev_team_id=${2}
+    provisioning_profile_uuid=${3}
+    if [ ! -z "${buidle_id}" ] && [ ! -z "${provisioning_profile_uuid}" ]; then
+provisioning_profile_list=$(cat<<EOT
+${provisioning_profile_list}
+                <key>${buidle_id}</key>
+                <string>${provisioning_profile_uuid}</string>
+EOT)
+    fi
+  fi
+done
+
+if [ "${EXPORT_METOHD}" = "app-store" ]; then
+cat <<EOT > "${abs_export_path}/exportOptioins.plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+        <key>signingStyle</key>
+        <string>manual</string>
+        <key>method</key>
+        <string>app-store</string>
+        <key>teamID</key>
+        <string>${apple_dev_team_id}</string>
+        <key>signingCertificate</key>
+        <string>iOS Distribution</string>
+        <key>provisioningProfiles</key>
+        <dict>
+${provisioning_profile_list}
+        </dict>
+        <key>iCloudContainerEnvironment</key>
+        <string>Production</string>
+        <key>uploadBitcode</key>
+        <true/>
+        <key>uploadSymbols</key>
+        <true/>
+</dict>
+</plist>
+EOT
+else
+  if [ "${EXPORT_METOHD}" = "development" ]; then
+    signing_certificate="iOS Developer"
+  else
+    signing_certificate="iOS Distribution"
+  fi
+cat <<EOT > "${abs_export_path}/exportOptioins.plist"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>method</key>
+	<string>ad-hoc</string>
+	<key>teamID</key>
+	<string>${apple_dev_team_id}</string>
+	<key>signingCertificate</key>
+	<string>${signing_certificate}</string>
+	<key>provisioningProfiles</key>
+	<dict>
+${provisioning_profile_list}
+	</dict>
+	<key>iCloudContainerEnvironment</key>
+	<string>Development</string>
+	<key>compileBitcode</key>
+	<true/>
+</dict>
+</plist>
+EOT
+fi
+
+echo "/usr/bin/xcodebuild -exportArchive -archivePath \"${abs_archive_path}\" -exportPath \"${abs_export_path}\" -exportOptionsPlist \"${abs_export_path}/exportOptioins.plist\""
+/usr/bin/xcodebuild -exportArchive -archivePath "${abs_archive_path}" -exportPath "${abs_export_path}" -exportOptionsPlist "${abs_export_path}/exportOptioins.plist" 
